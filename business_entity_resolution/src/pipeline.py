@@ -79,7 +79,7 @@ def subsample_negatives(feat_df: pd.DataFrame, labels: np.ndarray, neg_per_pos_c
 def run(data_dir: str, out_dir: str, n_splits: int = 5, seed: int = 42,
         sample_s1: int | None = None, max_df: int = 300, prefix_len: int = 4,
         max_pairs_per_prefix_key: int = 200_000, neg_per_pos_cap: int = 15,
-        use_tfidf: bool = False) -> None:
+        use_tfidf: bool = False, test_chunk_size: int | None = 100_000) -> None:
     os.makedirs(out_dir, exist_ok=True)
 
     # ---------- 1. Load + validate ----------
@@ -171,35 +171,41 @@ def run(data_dir: str, out_dir: str, n_splits: int = 5, seed: int = 42,
     log(f"All-singleton baseline macro F0.5 on train: {baseline:.4f} (your real edge over the "
         f"leaderboard is measured above this floor, not from 0)")
 
-    # ---------- 8. Inference: blocking on TEST ----------
-    log("Blocking test S1 vs S2/S3...")
-    cand_te_s2 = block(s1_te, s2_te)
-    cand_te_s3 = block(s1_te, s3_te)
-    cand_te = union_candidates(cand_te_s2, cand_te_s3)
-    log(f"Test candidate pairs: {sum(len(v) for v in cand_te.values()):,}")
-
-    log("Featurizing test candidates (vectorized)...")
-    pairs_te = pd.concat([build_pair_frame(s1_te, s2_te, cand_te_s2),
-                          build_pair_frame(s1_te, s3_te, cand_te_s3)], ignore_index=True)
-    test_feat_df = build_feature_frame_vectorized(pairs_te)
-
-    if len(test_feat_df) > 0:
-        X_test = test_feat_df[FEATURE_NAMES].to_numpy()
-        raw_probs = predict_with_models(models, X_test)
-        calibrated_probs = iso.predict(raw_probs)
-    else:
-        calibrated_probs = np.array([])
-
-    # ---------- 9. Apply threshold -> matching_results ----------
-    matches: Dict[str, Set[str]] = {eid: set() for eid in s1_te["entity_id"]}
-    if len(test_feat_df) > 0:
-        keep = calibrated_probs >= best_t
-        for s1_id, other_id in zip(
-            test_feat_df["s1_id"].to_numpy()[keep], test_feat_df["other_id"].to_numpy()[keep]
-        ):
-            matches[s1_id].add(other_id)
-
+    # ---------- 8. Inference: blocking on TEST (chunked to bound peak RAM) ----------
+    # The full test join (1.7M S1 x ~10M S2/S3) never fits in RAM at once, and
+    # outputs are only written at the end — so a mid-run OOM loses everything.
+    # Chunking test S1 keeps peak RAM flat; matches/candidates accumulate incrementally.
+    import gc
     all_test_s1_ids = s1_te["entity_id"].tolist()
+    matches: Dict[str, Set[str]] = {eid: set() for eid in all_test_s1_ids}
+    cand_te: Dict[str, Set[str]] = {}
+    chunk = test_chunk_size or len(s1_te)
+    n_chunks = (len(s1_te) + chunk - 1) // chunk
+    log(f"Test inference in {n_chunks} chunk(s) of ~{chunk:,} S1 (test S1={len(s1_te):,})...")
+    for ci in range(n_chunks):
+        s1_chunk = s1_te.iloc[ci * chunk:(ci + 1) * chunk]
+        t0 = time.time()
+        c_s2 = block(s1_chunk, s2_te)
+        c_s3 = block(s1_chunk, s3_te)
+        pairs_te = pd.concat([build_pair_frame(s1_chunk, s2_te, c_s2),
+                              build_pair_frame(s1_chunk, s3_te, c_s3)], ignore_index=True)
+        feat_te = build_feature_frame_vectorized(pairs_te)
+        if len(feat_te) > 0:
+            probs = iso.predict(predict_with_models(models, feat_te[FEATURE_NAMES].to_numpy()))
+            keep = probs >= best_t
+            for s1_id, other_id in zip(feat_te["s1_id"].to_numpy()[keep],
+                                       feat_te["other_id"].to_numpy()[keep]):
+                matches[s1_id].add(other_id)
+        for k, v in c_s2.items():
+            cand_te.setdefault(k, set()).update(v)
+        for k, v in c_s3.items():
+            cand_te.setdefault(k, set()).update(v)
+        log(f"chunk {ci + 1}/{n_chunks}: pairs={len(feat_te):,} "
+            f"matched_so_far={sum(1 for v in matches.values() if v):,} ({time.time() - t0:.1f}s)")
+        del c_s2, c_s3, pairs_te, feat_te
+        gc.collect()
+
+    # ---------- 9. Write outputs ----------
     write_result_tsv(os.path.join(out_dir, "matching_results.tsv"), matches, all_test_s1_ids)
     write_result_tsv(os.path.join(out_dir, "candidate_pairs.tsv"), cand_te, all_test_s1_ids)
     log(f"Wrote matching_results.tsv and candidate_pairs.tsv to {out_dir}")
@@ -221,6 +227,8 @@ def main():
     ap.add_argument("--max-pairs-per-prefix-key", type=int, default=200_000)
     ap.add_argument("--neg-per-pos-cap", type=int, default=15)
     ap.add_argument("--use-tfidf", action="store_true", help="small-sample TF-IDF blocking only")
+    ap.add_argument("--test-chunk-size", type=int, default=100_000,
+                    help="test S1 rows per inference chunk; bounds peak RAM (0 = no chunking)")
     ap.add_argument("--validate", action="store_true",
                      help="also run utils/validate_submission.py if found alongside --data-dir")
     args = ap.parse_args()
@@ -228,7 +236,8 @@ def main():
     run(args.data_dir, args.out_dir, n_splits=args.n_splits, seed=args.seed,
         sample_s1=args.sample_s1, max_df=args.max_df, prefix_len=args.prefix_len,
         max_pairs_per_prefix_key=args.max_pairs_per_prefix_key,
-        neg_per_pos_cap=args.neg_per_pos_cap, use_tfidf=args.use_tfidf)
+        neg_per_pos_cap=args.neg_per_pos_cap, use_tfidf=args.use_tfidf,
+        test_chunk_size=(args.test_chunk_size or None))
 
     if args.validate:
         validator = os.path.join(args.data_dir, "utils", "validate_submission.py")
