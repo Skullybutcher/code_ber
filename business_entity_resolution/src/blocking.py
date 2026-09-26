@@ -111,6 +111,65 @@ def _cap_document_frequency(token_frame, max_df: int):
     return token_frame[token_frame["token"].isin(keep)]
 
 
+def build_token_index(other_df, min_len: int = 4, max_df: int = 300):
+    """Precompute the capped (entity_id_other, token) posting list for one other side.
+
+    Build ONCE per other source and reuse across test chunks — rebuilding this
+    25M-row frame per chunk is what made chunked inference crawl.
+    """
+    if "_norm_name" not in other_df.columns:
+        other_df["_norm_name"] = other_df["business_name"].map(normalize_name)
+        other_df["_norm_addr"] = other_df["business_address"].map(normalize_address)
+    tok = _cap_document_frequency(_token_frame(other_df, min_len), max_df)
+    return tok.rename(columns={"entity_id": "entity_id_other"})
+
+
+def query_token_index(s1_df, other_index, min_len: int = 4, max_df: int = 300) -> Dict[str, Set[str]]:
+    """Token blocking of one S1 chunk against a prebuilt other-side index."""
+    if "_norm_name" not in s1_df.columns:
+        s1_df["_norm_name"] = s1_df["business_name"].map(normalize_name)
+        s1_df["_norm_addr"] = s1_df["business_address"].map(normalize_address)
+    s1_tok = _cap_document_frequency(_token_frame(s1_df, min_len), max_df)
+    s1_tok = s1_tok.rename(columns={"entity_id": "entity_id_s1"})
+    if len(s1_tok) == 0 or len(other_index) == 0:
+        return {}
+    merged = s1_tok.merge(other_index, on="token")
+    pairs = merged[["entity_id_s1", "entity_id_other"]].drop_duplicates()
+    return pairs.groupby("entity_id_s1")["entity_id_other"].apply(set).to_dict()
+
+
+def build_prefix_index(other_df, prefix_len: int = 4):
+    """Precompute the (entity_id_other, key) frame + per-key counts for one other side."""
+    if "_norm_name" not in other_df.columns:
+        other_df["_norm_name"] = other_df["business_name"].map(normalize_name)
+        other_df["_norm_addr"] = other_df["business_address"].map(normalize_address)
+    other_key = other_df[["entity_id"]].copy()
+    other_key["key"] = other_df["country"].str.lower().fillna("") + "|" + other_df["_norm_name"].str[:prefix_len]
+    other_key = other_key.rename(columns={"entity_id": "entity_id_other"})
+    return other_key, other_key["key"].value_counts()
+
+
+def query_prefix_index(s1_df, other_key, other_counts, prefix_len: int = 4,
+                       max_pairs_per_key: int = 200_000) -> Dict[str, Set[str]]:
+    """Prefix blocking of one S1 chunk against a prebuilt other-side index."""
+    if "_norm_name" not in s1_df.columns:
+        s1_df["_norm_name"] = s1_df["business_name"].map(normalize_name)
+        s1_df["_norm_addr"] = s1_df["business_address"].map(normalize_address)
+    s1_key = s1_df[["entity_id"]].copy()
+    s1_key["key"] = s1_df["country"].str.lower().fillna("") + "|" + s1_df["_norm_name"].str[:prefix_len]
+    s1_key = s1_key.rename(columns={"entity_id": "entity_id_s1"})
+    s1_counts = s1_key["key"].value_counts()
+    common = set(s1_counts.index) & set(other_counts.index)
+    safe = {k for k in common if s1_counts[k] * other_counts[k] <= max_pairs_per_key}
+    s1_key = s1_key[s1_key["key"].isin(safe)]
+    other_sub = other_key[other_key["key"].isin(safe)]
+    if len(s1_key) == 0 or len(other_sub) == 0:
+        return {}
+    merged = s1_key.merge(other_sub, on="key")
+    pairs = merged[["entity_id_s1", "entity_id_other"]].drop_duplicates()
+    return pairs.groupby("entity_id_s1")["entity_id_other"].apply(set).to_dict()
+
+
 def generate_candidates_token(s1_df, other_df, min_len: int = 4, max_df: int = 300) -> Dict[str, Set[str]]:
     """Scalable token blocking via vectorized merge. Default for full scale."""
     for df in (s1_df, other_df):
