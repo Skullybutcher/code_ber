@@ -450,6 +450,10 @@ def run(data_dir: str, out_dir: str, n_splits: int = 5, seed: int = 42,
     if load_model_dir:
         models, iso, best_t = load_artifacts(load_model_dir)
         best_score = float("nan")
+        # Free the train-side frames — not needed for test inference
+        del s1_tr, s2_tr, s3_tr, gt
+        gc.collect()
+        log("Freed train frames (load-model-dir mode).")
     else:
         # ---------- 3. Blocking on TRAIN ----------
         log(f"Blocking train S1 vs S2 (max_df={max_df})...")
@@ -501,12 +505,12 @@ def run(data_dir: str, out_dir: str, n_splits: int = 5, seed: int = 42,
         save_artifacts(save_model_dir, models, iso, best_t, best_score)
 
     # ---------- 8. Inference: blocking on TEST (chunked to bound peak RAM) ----------
-    # The full test join (1.7M S1 x ~10M S2/S3) never fits in RAM at once, and
-    # outputs are only written at the end â€” so a mid-run OOM loses everything.
-    # Chunking test S1 keeps peak RAM flat; matches/candidates accumulate incrementally.
+    # cand_te is streamed to disk per chunk — accumulating 80M+ entries in a dict
+    # would consume ~8 GB and is the primary OOM source on 16 GB Kaggle instances.
+    # matches dict is bounded: ~1.7M keys × small sets of matched ids (~200 MB).
     all_test_s1_ids = s1_te["entity_id"].tolist()
     matches: Dict[str, Set[str]] = {eid: set() for eid in all_test_s1_ids}
-    cand_te: Dict[str, Set[str]] = {}
+    cand_path = os.path.join(out_dir, "candidate_pairs.tsv")
     chunk = test_chunk_size or len(s1_te)
     n_chunks = (len(s1_te) + chunk - 1) // chunk
     log(f"Test inference in {n_chunks} chunk(s) of ~{chunk:,} S1 (test S1={len(s1_te):,})...")
@@ -543,6 +547,9 @@ def run(data_dir: str, out_dir: str, n_splits: int = 5, seed: int = 42,
     else:
         tok_idx_s2 = tok_idx_s3 = pfx_idx_s2 = pfx_idx_s3 = None
         pfx_cnt_s2 = pfx_cnt_s3 = None
+
+    with open(cand_path, "w", encoding="utf-8") as cand_f:
+        cand_f.write("source1_entity_id\tcandidate_entity_ids\n")
 
     for ci in range(n_chunks):
         s1_chunk = s1_te.iloc[ci * chunk:(ci + 1) * chunk]
@@ -593,10 +600,15 @@ def run(data_dir: str, out_dir: str, n_splits: int = 5, seed: int = 42,
             for s1_id, other_id in zip(feat_te["s1_id"].to_numpy()[keep],
                                        feat_te["other_id"].to_numpy()[keep]):
                 matches[s1_id].add(other_id)
-        for k, v in c_s2.items():
-            cand_te.setdefault(k, set()).update(v)
-        for k, v in c_s3.items():
-            cand_te.setdefault(k, set()).update(v)
+
+        # Stream candidate pairs to disk immediately — never accumulate in RAM.
+        # Union c_s2 and c_s3 per S1 key, write one row per S1 entity in this chunk.
+        all_cand_keys = set(c_s2) | set(c_s3)
+        with open(cand_path, "a", encoding="utf-8") as cand_f:
+            for k in all_cand_keys:
+                combined = c_s2.get(k, set()) | c_s3.get(k, set())
+                cand_f.write(f"{k}\t{','.join(sorted(combined))}\n")
+
         log(f"chunk {ci + 1}/{n_chunks}: pairs={len(feat_te):,} "
             f"matched_so_far={sum(1 for v in matches.values() if v):,} ({time.time() - t0:.1f}s)")
         del c_s2, c_s3, pairs_te, feat_te
@@ -604,7 +616,6 @@ def run(data_dir: str, out_dir: str, n_splits: int = 5, seed: int = 42,
 
     # ---------- 9. Write outputs ----------
     write_result_tsv(os.path.join(out_dir, "matching_results.tsv"), matches, all_test_s1_ids)
-    write_result_tsv(os.path.join(out_dir, "candidate_pairs.tsv"), cand_te, all_test_s1_ids)
     log(f"Wrote matching_results.tsv and candidate_pairs.tsv to {out_dir}")
 
     n_matched = sum(1 for v in matches.values() if v)
