@@ -1,4 +1,4 @@
-"""
+﻿"""
 End-to-end pipeline: load -> validate -> normalize -> block -> featurize ->
 train (grouped OOF) -> calibrate -> tune threshold -> run test inference ->
 write candidate_pairs.tsv + matching_results.tsv.
@@ -16,15 +16,11 @@ import pickle
 import subprocess
 import sys
 import time
-from typing import Dict, List, Set, Tuple, Optional
-from collections import defaultdict
+from typing import Dict, List, Set, Tuple
 
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
-from sklearn.model_selection import GroupKFold
-from sklearn.isotonic import IsotonicRegression
-from rapidfuzz import fuzz
 
 # Optional heavy deps
 try:
@@ -58,8 +54,8 @@ def log(msg: str) -> None:
 
 class CrossEncoderReranker:
     """Cross-encoder reranker for hard negative pairs. Uses XLM-RoBERTa/DeBERTa for multilingual support."""
-    
-    def __init__(self, model_name: str = "xlm-roberta-base", threshold: float = 0.92, 
+
+    def __init__(self, model_name: str = "xlm-roberta-base", threshold: float = 0.92,
                  device: str = "cpu", max_length: int = 256, batch_size: int = 32):
         if not TRANSFORMERS_AVAILABLE:
             raise RuntimeError("transformers not installed. pip install transformers torch")
@@ -72,27 +68,27 @@ class CrossEncoderReranker:
         self.threshold = threshold
         self.max_length = max_length
         self.batch_size = batch_size
-    
+
     def load_finetuned(self, path: str):
         """Load fine-tuned weights."""
         state = torch.load(path, map_location=self.device)
         self.model.load_state_dict(state)
         log(f"Loaded fine-tuned cross-encoder from {path}")
-    
+
     def save_finetuned(self, path: str):
         torch.save(self.model.state_dict(), path)
         log(f"Saved fine-tuned cross-encoder to {path}")
-    
-    def predict_proba(self, name1: List[str], addr1: List[str], 
+
+    def predict_proba(self, name1: List[str], addr1: List[str],
                       name2: List[str], addr2: List[str]) -> np.ndarray:
         """Return probability of match for each pair."""
         texts1 = [f"{n} [SEP] {a}" for n, a in zip(name1, addr1)]
         texts2 = [f"{n} [SEP] {a}" for n, a in zip(name2, addr2)]
-        
+
         all_probs = []
         for i in range(0, len(texts1), self.batch_size):
-            batch1 = texts1[i:i+self.batch_size]
-            batch2 = texts2[i:i+self.batch_size]
+            batch1 = texts1[i:i + self.batch_size]
+            batch2 = texts2[i:i + self.batch_size]
             enc = self.tokenizer(
                 batch1, batch2, padding=True, truncation=True,
                 max_length=self.max_length, return_tensors="pt"
@@ -102,42 +98,42 @@ class CrossEncoderReranker:
                 probs = torch.sigmoid(logits).cpu().numpy()
             all_probs.extend(probs if probs.ndim > 0 else [probs])
         return np.array(all_probs)
-    
-    def predict(self, name1: List[str], addr1: List[str], 
+
+    def predict(self, name1: List[str], addr1: List[str],
                 name2: List[str], addr2: List[str]) -> np.ndarray:
         """Return binary predictions using threshold."""
         return (self.predict_proba(name1, addr1, name2, addr2) >= self.threshold).astype(int)
-    
+
     def finetune(self, name1: List[str], addr1: List[str],
                  name2: List[str], addr2: List[str], labels: np.ndarray,
                  epochs: int = 3, lr: float = 2e-5, val_split: float = 0.1):
         """Fine-tune on hard negatives."""
         from torch.utils.data import DataLoader, TensorDataset
         import torch.nn as nn
-        
+
         texts1 = [f"{n} [SEP] {a}" for n, a in zip(name1, addr1)]
         texts2 = [f"{n} [SEP] {a}" for n, a in zip(name2, addr2)]
-        
+
         enc = self.tokenizer(
             texts1, texts2, padding=True, truncation=True,
             max_length=self.max_length, return_tensors="pt"
         )
-        
+
         dataset = TensorDataset(
-            enc["input_ids"], enc["attention_mask"], 
+            enc["input_ids"], enc["attention_mask"],
             torch.tensor(labels, dtype=torch.float32)
         )
-        
+
         n_val = int(len(dataset) * val_split)
         n_train = len(dataset) - n_val
         train_ds, val_ds = torch.utils.data.random_split(dataset, [n_train, n_val])
-        
+
         train_loader = DataLoader(train_ds, batch_size=16, shuffle=True)
         val_loader = DataLoader(val_ds, batch_size=32)
-        
+
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr)
         criterion = nn.BCEWithLogitsLoss()
-        
+
         self.model.train()
         for epoch in range(epochs):
             total_loss = 0
@@ -149,8 +145,8 @@ class CrossEncoderReranker:
                 loss.backward()
                 optimizer.step()
                 total_loss += loss.item()
-            log(f"  Epoch {epoch+1}/{epochs} - Train Loss: {total_loss/len(train_loader):.4f}")
-            
+            log(f"  Epoch {epoch + 1}/{epochs} - Train Loss: {total_loss / len(train_loader):.4f}")
+
             # Validation
             self.model.eval()
             val_loss = 0
@@ -159,13 +155,13 @@ class CrossEncoderReranker:
                     input_ids, attention_mask, labels_batch = [b.to(self.device) for b in batch]
                     logits = self.model(input_ids=input_ids, attention_mask=attention_mask).logits.squeeze(-1)
                     val_loss += nn.BCEWithLogitsLoss()(logits, labels_batch).item()
-            log(f"  Val Loss: {val_loss/len(val_loader):.4f}")
+            log(f"  Val Loss: {val_loss / len(val_loader):.4f}")
             self.model.train()
 
 
 class FaissDenseRetriever:
     """Dense retrieval blocking using FAISS and bi-encoder embeddings."""
-    
+
     def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
                  device: str = "cpu", top_k: int = 50):
         if not FAISS_AVAILABLE:
@@ -179,15 +175,15 @@ class FaissDenseRetriever:
         self.top_k = top_k
         self.index = None
         self.other_ids = None
-    
+
     @torch.no_grad()
     def encode(self, texts: List[str], batch_size: int = 256) -> np.ndarray:
         """Encode texts to normalized embeddings."""
         all_embs = []
         for i in range(0, len(texts), batch_size):
-            batch = texts[i:i+batch_size]
-            enc = self.tokenizer(batch, padding=True, truncation=True, 
-                                max_length=128, return_tensors="pt").to(self.device)
+            batch = texts[i:i + batch_size]
+            enc = self.tokenizer(batch, padding=True, truncation=True,
+                                 max_length=128, return_tensors="pt").to(self.device)
             outputs = self.model(**enc)
             # Mean pooling
             emb = outputs.last_hidden_state * enc["attention_mask"].unsqueeze(-1)
@@ -195,7 +191,7 @@ class FaissDenseRetriever:
             emb = torch.nn.functional.normalize(emb, p=2, dim=1)
             all_embs.append(emb.cpu().numpy())
         return np.vstack(all_embs)
-    
+
     def build_index(self, other_dfs: List[pd.DataFrame]):
         """Build FAISS index from one or more other side DataFrames."""
         all_texts = []
@@ -204,10 +200,10 @@ class FaissDenseRetriever:
             texts = (df["_norm_name"].fillna("") + " " + df["_norm_addr"].fillna("")).tolist()
             all_texts.extend(texts)
             all_ids.extend(df["entity_id"].tolist())
-        
+
         log(f"Encoding {len(all_texts)} records for FAISS index...")
         embs = self.encode(all_texts)
-        
+
         # Build IVF index for large datasets
         d = embs.shape[1]
         nlist = min(4096, max(1, int(len(embs) ** 0.5)))
@@ -218,14 +214,14 @@ class FaissDenseRetriever:
         self.index.nprobe = min(32, nlist)
         self.other_ids = np.array(all_ids)
         log(f"FAISS index built with {self.index.ntotal} vectors, nlist={nlist}")
-    
+
     def search(self, s1_chunk: pd.DataFrame) -> Dict[str, Set[str]]:
         """Search for top-K candidates for S1 chunk."""
         texts = (s1_chunk["_norm_name"].fillna("") + " " + s1_chunk["_norm_addr"].fillna("")).tolist()
         q_embs = self.encode(texts)
-        
+
         scores, idx = self.index.search(q_embs, self.top_k)
-        
+
         candidates = {}
         s1_ids = s1_chunk["entity_id"].to_numpy()
         for i, s1_id in enumerate(s1_ids):
@@ -237,13 +233,13 @@ class FaissDenseRetriever:
         return candidates
 
 
-def generate_candidates_faiss(s1_df: pd.DataFrame, other_df: pd.DataFrame, 
+def generate_candidates_faiss(s1_df: pd.DataFrame, other_df: pd.DataFrame,
                               retriever: FaissDenseRetriever) -> Dict[str, Set[str]]:
     """Wrapper for FAISS dense retrieval blocking."""
     return retriever.search(s1_df)
 
 
-def mine_hard_negatives(feat_df: pd.DataFrame, labels: np.ndarray, 
+def mine_hard_negatives(feat_df: pd.DataFrame, labels: np.ndarray,
                         calibrated_probs: np.ndarray,
                         top_k: int = 5000, margin: float = 0.1) -> Tuple[np.ndarray, np.ndarray]:
     """
@@ -253,35 +249,43 @@ def mine_hard_negatives(feat_df: pd.DataFrame, labels: np.ndarray,
     """
     fp_mask = (labels == 0) & (calibrated_probs >= 0.5)  # Confident false positives
     fn_mask = (labels == 1) & (calibrated_probs < 0.5)   # Missed true matches
-    
+
     fp_indices = np.where(fp_mask)[0]
     fn_indices = np.where(fn_mask)[0]
-    
+
     # Sort FPs by probability descending (most confident mistakes first)
     if len(fp_indices) > 0:
         fp_probs = calibrated_probs[fp_indices]
         fp_order = np.argsort(-fp_probs)
         fp_indices = fp_indices[fp_order[:min(top_k, len(fp_indices))]]
-    
+
     # Sort FNs by probability ascending (most confident misses first)
     if len(fn_indices) > 0:
         fn_probs = calibrated_probs[fn_indices]
         fn_order = np.argsort(fn_probs)
         fn_indices = fn_indices[fn_order[:min(top_k, len(fn_indices))]]
-    
+
     hard_neg_idx = np.concatenate([fp_indices, fn_indices])
     hard_neg_labels = labels[hard_neg_idx]
-    
+
     return hard_neg_idx, hard_neg_labels
 
 
-def consensus_predict(tfidf_probs: np.ndarray, ce_probs: np.ndarray, 
+def add_norm_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Add normalized name and address columns to a source DataFrame."""
+    df = df.copy()
+    df["_norm_name"] = df["business_name"].map(normalize_name)
+    df["_norm_addr"] = df["business_address"].map(normalize_address)
+    return df
+
+
+def consensus_predict(tfidf_probs: np.ndarray, ce_probs: np.ndarray,
                       threshold_tfidf: float = 0.65, threshold_ce: float = 0.92,
                       mode: str = "and") -> np.ndarray:
     """Consensus prediction: require both TF-IDF and Cross-Encoder to agree."""
     tfidf_pred = tfidf_probs >= threshold_tfidf
     ce_pred = ce_probs >= threshold_ce
-    
+
     if mode == "and":
         return (tfidf_pred & ce_pred).astype(int)
     elif mode == "or":
@@ -292,10 +296,6 @@ def consensus_predict(tfidf_probs: np.ndarray, ce_probs: np.ndarray,
         return (combined >= 0.5).astype(int)
     else:
         raise ValueError(f"Unknown mode: {mode}")
-    df = df.copy()
-    df["_norm_name"] = df["business_name"].map(normalize_name)
-    df["_norm_addr"] = df["business_address"].map(normalize_address)
-    return df
 
 
 def build_pair_frame(s1_df, other_df, candidates: Dict[str, Set[str]]) -> pd.DataFrame:
@@ -307,7 +307,7 @@ def build_pair_frame(s1_df, other_df, candidates: Dict[str, Set[str]]) -> pd.Dat
             other_ids.append(other_id)
     if not s1_ids:
         return pd.DataFrame(columns=["s1_id", "other_id", "name1", "addr1", "country1",
-                                      "name2", "addr2", "country2"])
+                                     "name2", "addr2", "country2"])
     pairs = pd.DataFrame({"s1_id": s1_ids, "other_id": other_ids})
     s1_cols = s1_df[["entity_id", "_norm_name", "_norm_addr", "country"]].rename(
         columns={"entity_id": "s1_id", "_norm_name": "name1", "_norm_addr": "addr1", "country": "country1"})
@@ -354,7 +354,6 @@ def load_or_build_frames(data_dir: str, cache_dir: str | None) -> tuple:
     manifest_path = os.path.join(cache_dir, "manifest.json") if cache_dir else None
     manifest: dict = {}
     if manifest_path and os.path.exists(manifest_path):
-        import json
         with open(manifest_path) as f:
             manifest = json.load(f)
     frames, new_manifest = [], {}
@@ -373,7 +372,6 @@ def load_or_build_frames(data_dir: str, cache_dir: str | None) -> tuple:
                 df.to_parquet(cached, index=False)
         new_manifest[fname] = key
     if manifest_path:
-        import json
         with open(manifest_path, "w") as f:
             json.dump(new_manifest, f)
     return tuple(frames)
@@ -381,7 +379,6 @@ def load_or_build_frames(data_dir: str, cache_dir: str | None) -> tuple:
 
 def save_artifacts(model_dir: str, models, iso, threshold: float, oof_score: float) -> None:
     os.makedirs(model_dir, exist_ok=True)
-    import json, pickle
     for i, m in enumerate(models):
         m.save_model(os.path.join(model_dir, f"model_{i}.txt"))
     with open(os.path.join(model_dir, "calibrator.pkl"), "wb") as f:
@@ -393,8 +390,6 @@ def save_artifacts(model_dir: str, models, iso, threshold: float, oof_score: flo
 
 
 def load_artifacts(model_dir: str):
-    import json, pickle
-    import lightgbm as lgb
     with open(os.path.join(model_dir, "meta.json")) as f:
         meta = json.load(f)
     models = [lgb.Booster(model_file=os.path.join(model_dir, f"model_{i}.txt"))
@@ -414,7 +409,8 @@ def run(data_dir: str, out_dir: str, n_splits: int = 5, seed: int = 42,
         save_model_dir: str | None = None, load_model_dir: str | None = None,
         use_cross_encoder: bool = False, cross_encoder_model: str = "xlm-roberta-base",
         cross_encoder_threshold: float = 0.92, use_faiss: bool = False,
-        faiss_top_k: int = 50, faiss_device: str = "cpu") -> None:
+        faiss_top_k: int = 50, faiss_device: str = "cpu",
+        consensus_mode: str = "and") -> None:
     os.makedirs(out_dir, exist_ok=True)
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
@@ -426,7 +422,7 @@ def run(data_dir: str, out_dir: str, n_splits: int = 5, seed: int = 42,
     validate_ground_truth_refs(gt, set(s1_tr.entity_id), set(s2_tr.entity_id), set(s3_tr.entity_id))
     # ---------- 2. Normalize (already applied by load_or_build_frames) ----------
     log(f"Train sizes: S1={len(s1_tr)} S2={len(s2_tr)} S3={len(s3_tr)} | "
-        f"GT rows={len(gt)} | singleton rate={sum(1 for v in gt.values() if not v)/len(gt):.3f}")
+        f"GT rows={len(gt)} | singleton rate={sum(1 for v in gt.values() if not v) / len(gt):.3f}")
     log(f"Test sizes: S1={len(s1_te)} S2={len(s2_te)} S3={len(s3_te)} | "
         f"test countries={sorted(s1_te.country.unique())}")
 
@@ -455,7 +451,7 @@ def run(data_dir: str, out_dir: str, n_splits: int = 5, seed: int = 42,
         models, iso, best_t = load_artifacts(load_model_dir)
         best_score = float("nan")
     else:
-            # ---------- 3. Blocking on TRAIN ----------
+        # ---------- 3. Blocking on TRAIN ----------
         log(f"Blocking train S1 vs S2 (max_df={max_df})...")
         cand_tr_s2 = block(s1_tr, s2_tr)
         log(f"Blocking train S1 vs S3 (max_df={max_df})...")
@@ -465,7 +461,7 @@ def run(data_dir: str, out_dir: str, n_splits: int = 5, seed: int = 42,
         recall = candidate_recall(gt, cand_tr)
         log(f"Train candidate recall: {recall:.4f}")
         if recall < 0.90:
-            log("WARNING: recall < 0.90 — lower --max-df / --prefix-len before trusting matcher.")
+            log("WARNING: recall < 0.90 â€” lower --max-df / --prefix-len before trusting matcher.")
 
         # ---------- 4. Build labeled pairs (vectorized) ----------
         log("Building pairwise feature frame (vectorized merges)...")
@@ -495,8 +491,8 @@ def run(data_dir: str, out_dir: str, n_splits: int = 5, seed: int = 42,
         log(f"Best threshold={best_t:.3f} -> OOF macro F0.5={best_score:.4f}")
 
         # sanity: all-singleton baseline, for comparison
-        empty_preds = {eid: set() for eid in all_s1_ids}
         from metric import macro_f05
+        empty_preds = {eid: set() for eid in all_s1_ids}
         baseline = macro_f05(gt, empty_preds, entity_ids=all_s1_ids)
         log(f"All-singleton baseline macro F0.5 on train: {baseline:.4f} (your real edge over the "
             f"leaderboard is measured above this floor, not from 0)")
@@ -506,9 +502,8 @@ def run(data_dir: str, out_dir: str, n_splits: int = 5, seed: int = 42,
 
     # ---------- 8. Inference: blocking on TEST (chunked to bound peak RAM) ----------
     # The full test join (1.7M S1 x ~10M S2/S3) never fits in RAM at once, and
-    # outputs are only written at the end — so a mid-run OOM loses everything.
+    # outputs are only written at the end â€” so a mid-run OOM loses everything.
     # Chunking test S1 keeps peak RAM flat; matches/candidates accumulate incrementally.
-    import gc
     all_test_s1_ids = s1_te["entity_id"].tolist()
     matches: Dict[str, Set[str]] = {eid: set() for eid in all_test_s1_ids}
     cand_te: Dict[str, Set[str]] = {}
@@ -516,7 +511,7 @@ def run(data_dir: str, out_dir: str, n_splits: int = 5, seed: int = 42,
     n_chunks = (len(s1_te) + chunk - 1) // chunk
     log(f"Test inference in {n_chunks} chunk(s) of ~{chunk:,} S1 (test S1={len(s1_te):,})...")
     use_index = not use_tfidf and n_chunks > 1
-    
+
     # Optional: FAISS dense retrieval index (built once, reused across chunks)
     faiss_retriever = None
     if use_faiss and FAISS_AVAILABLE:
@@ -525,7 +520,7 @@ def run(data_dir: str, out_dir: str, n_splits: int = 5, seed: int = 42,
         faiss_retriever = FaissDenseRetriever(top_k=faiss_top_k, device=faiss_device)
         faiss_retriever.build_index([s2_te, s3_te])  # combined index for both S2 and S3
         log(f"FAISS index ready ({time.time() - t_idx:.1f}s).")
-    
+
     # Optional: Cross-encoder reranker (loaded once, reused across chunks)
     cross_encoder = None
     if use_cross_encoder and TRANSFORMERS_AVAILABLE:
@@ -536,7 +531,7 @@ def run(data_dir: str, out_dir: str, n_splits: int = 5, seed: int = 42,
             device="cuda" if torch.cuda.is_available() else "cpu"
         )
         log(f"Cross-encoder loaded ({time.time() - t_ce:.1f}s).")
-    
+
     if use_index:
         log("Precomputing other-side blocking indices once (reused by all chunks)...")
         t_idx = time.time()
@@ -548,7 +543,7 @@ def run(data_dir: str, out_dir: str, n_splits: int = 5, seed: int = 42,
     else:
         tok_idx_s2 = tok_idx_s3 = pfx_idx_s2 = pfx_idx_s3 = None
         pfx_cnt_s2 = pfx_cnt_s3 = None
-    
+
     for ci in range(n_chunks):
         s1_chunk = s1_te.iloc[ci * chunk:(ci + 1) * chunk]
         t0 = time.time()
@@ -564,21 +559,21 @@ def run(data_dir: str, out_dir: str, n_splits: int = 5, seed: int = 42,
         else:
             c_s2 = block(s1_chunk, s2_te)
             c_s3 = block(s1_chunk, s3_te)
-        
+
         # FAISS dense retrieval candidates (union with token/prefix)
         if faiss_retriever is not None:
             faiss_cand = faiss_retriever.search(s1_chunk)
             c_s2 = union_candidates(c_s2, faiss_cand)
             c_s3 = union_candidates(c_s3, faiss_cand)
-        
+
         pairs_te = pd.concat([build_pair_frame(s1_chunk, s2_te, c_s2),
                               build_pair_frame(s1_chunk, s3_te, c_s3)], ignore_index=True)
         feat_te = build_feature_frame_vectorized(pairs_te)
-        
+
         if len(feat_te) > 0:
             # LightGBM probabilities
             lgb_probs = iso.predict(predict_with_models(models, feat_te[FEATURE_NAMES].to_numpy()))
-            
+
             # Cross-encoder reranking for consensus
             if cross_encoder is not None:
                 log(f"  Cross-encoder reranking {len(feat_te):,} pairs...")
@@ -588,13 +583,13 @@ def run(data_dir: str, out_dir: str, n_splits: int = 5, seed: int = 42,
                     feat_te["name2"].fillna("").tolist(),
                     feat_te["addr2"].fillna("").tolist()
                 )
-                # Consensus: both LightGBM and Cross-Encoder must agree (AND)
-                keep = consensus_predict(lgb_probs, ce_probs, 
+                # Consensus: both LightGBM and Cross-Encoder must agree
+                keep = consensus_predict(lgb_probs, ce_probs,
                                          threshold_tfidf=best_t, threshold_ce=cross_encoder_threshold,
-                                         mode="and")
+                                         mode=consensus_mode)
             else:
                 keep = lgb_probs >= best_t
-            
+
             for s1_id, other_id in zip(feat_te["s1_id"].to_numpy()[keep],
                                        feat_te["other_id"].to_numpy()[keep]):
                 matches[s1_id].add(other_id)
@@ -614,7 +609,7 @@ def run(data_dir: str, out_dir: str, n_splits: int = 5, seed: int = 42,
 
     n_matched = sum(1 for v in matches.values() if v)
     log(f"Predicted non-singletons: {n_matched}/{len(all_test_s1_ids)} "
-        f"({n_matched/len(all_test_s1_ids):.3f})")
+        f"({n_matched / len(all_test_s1_ids):.3f})")
 
 
 def main():
@@ -632,7 +627,7 @@ def main():
     ap.add_argument("--test-chunk-size", type=int, default=100_000,
                     help="test S1 rows per inference chunk; bounds peak RAM (0 = no chunking)")
     ap.add_argument("--validate", action="store_true",
-                     help="also run utils/validate_submission.py if found alongside --data-dir")
+                    help="also run utils/validate_submission.py if found alongside --data-dir")
     # Advanced options
     ap.add_argument("--min-len", type=int, default=4,
                     help="min token length for token blocking (higher = fewer candidates)")
@@ -668,7 +663,8 @@ def main():
         use_faiss=args.use_faiss, faiss_top_k=args.faiss_top_k,
         faiss_device=args.faiss_device, use_cross_encoder=args.use_cross_encoder,
         cross_encoder_model=args.cross_encoder_model,
-        cross_encoder_threshold=args.cross_encoder_threshold)
+        cross_encoder_threshold=args.cross_encoder_threshold,
+        consensus_mode=args.consensus_mode)
 
     if args.validate:
         validator = os.path.join(args.data_dir, "utils", "validate_submission.py")
