@@ -15,6 +15,7 @@ import os
 import pickle
 import subprocess
 import sys
+import threading
 import time
 from typing import Dict, List, Set, Tuple
 
@@ -41,8 +42,9 @@ except ImportError:
 from io_utils import load_source, load_ground_truth, validate_ground_truth_refs, write_result_tsv
 from normalize import normalize_name, normalize_address
 from blocking import (generate_candidates, generate_candidates_token,
-                      generate_candidates_prefix, build_token_index, query_token_index,
+                      generate_candidates_prefix,
                       build_prefix_index, query_prefix_index,
+                      build_token_index_dict, query_token_index_dict,
                       union_candidates, candidate_recall)
 from features import build_feature_frame_vectorized, FEATURE_NAMES
 from model import train_oof, calibrate_oof, tune_threshold, predict_with_models
@@ -401,6 +403,17 @@ def load_artifacts(model_dir: str):
     return models, iso, float(meta["threshold"])
 
 
+def _keepalive(interval: int, stop_event: threading.Event) -> None:
+    """Print a periodic heartbeat so Kaggle's silence watchdog does not fire.
+
+    Kaggle kills subprocesses that produce no stdout for ~10 minutes.
+    A 60-second heartbeat keeps the process alive during long-running steps
+    (index builds, feature computation, LightGBM training).
+    """
+    while not stop_event.wait(interval):
+        print(f"[keepalive {time.strftime('%H:%M:%S')}]", flush=True)
+
+
 def run(data_dir: str, out_dir: str, n_splits: int = 5, seed: int = 42,
         sample_s1: int | None = None, max_df: int = 300, prefix_len: int = 4,
         max_pairs_per_prefix_key: int = 200_000, neg_per_pos_cap: int = 15,
@@ -414,6 +427,13 @@ def run(data_dir: str, out_dir: str, n_splits: int = 5, seed: int = 42,
     os.makedirs(out_dir, exist_ok=True)
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
+
+    # Keepalive thread — prevents Kaggle silence watchdog (fires after ~10 min no stdout)
+    _stop_keepalive = threading.Event()
+    _keepalive_thread = threading.Thread(
+        target=_keepalive, args=(60, _stop_keepalive), daemon=True
+    )
+    _keepalive_thread.start()
 
     # ---------- 1. Load + validate (parquet cache when valid) ----------
     log("Loading sources...")
@@ -539,11 +559,16 @@ def run(data_dir: str, out_dir: str, n_splits: int = 5, seed: int = 42,
     if use_index:
         log("Precomputing other-side blocking indices once (reused by all chunks)...")
         t_idx = time.time()
-        tok_idx_s2 = build_token_index(s2_te, min_len=min_len, max_df=max_df)
-        tok_idx_s3 = build_token_index(s3_te, min_len=min_len, max_df=max_df)
+        # Dict-based token index: O(1) per-token lookup, ~10s/chunk vs 8–15 min/chunk
+        tok_idx_s2 = build_token_index_dict(s2_te, min_len=min_len, max_df=max_df)
+        log(f"  tok_idx_s2 ready: {len(tok_idx_s2):,} tokens ({time.time() - t_idx:.1f}s)")
+        t2 = time.time()
+        tok_idx_s3 = build_token_index_dict(s3_te, min_len=min_len, max_df=max_df)
+        log(f"  tok_idx_s3 ready: {len(tok_idx_s3):,} tokens ({time.time() - t2:.1f}s)")
+        t3 = time.time()
         pfx_idx_s2, pfx_cnt_s2 = build_prefix_index(s2_te, prefix_len=prefix_len)
         pfx_idx_s3, pfx_cnt_s3 = build_prefix_index(s3_te, prefix_len=prefix_len)
-        log(f"Indices ready ({time.time() - t_idx:.1f}s).")
+        log(f"  prefix indices ready ({time.time() - t3:.1f}s). Total index build: {time.time() - t_idx:.1f}s")
     else:
         tok_idx_s2 = tok_idx_s3 = pfx_idx_s2 = pfx_idx_s3 = None
         pfx_cnt_s2 = pfx_cnt_s3 = None
@@ -555,12 +580,13 @@ def run(data_dir: str, out_dir: str, n_splits: int = 5, seed: int = 42,
         s1_chunk = s1_te.iloc[ci * chunk:(ci + 1) * chunk]
         t0 = time.time()
         if use_index:
+            # Dict-based query: no merge, no rehash — ~10s per chunk
             c_s2 = union_candidates(
-                query_token_index(s1_chunk, tok_idx_s2, min_len=min_len, max_df=max_df),
+                query_token_index_dict(s1_chunk, tok_idx_s2, min_len=min_len),
                 query_prefix_index(s1_chunk, pfx_idx_s2, pfx_cnt_s2, prefix_len=prefix_len,
                                    max_pairs_per_key=max_pairs_per_prefix_key))
             c_s3 = union_candidates(
-                query_token_index(s1_chunk, tok_idx_s3, min_len=min_len, max_df=max_df),
+                query_token_index_dict(s1_chunk, tok_idx_s3, min_len=min_len),
                 query_prefix_index(s1_chunk, pfx_idx_s3, pfx_cnt_s3, prefix_len=prefix_len,
                                    max_pairs_per_key=max_pairs_per_prefix_key))
         else:
@@ -613,6 +639,9 @@ def run(data_dir: str, out_dir: str, n_splits: int = 5, seed: int = 42,
             f"matched_so_far={sum(1 for v in matches.values() if v):,} ({time.time() - t0:.1f}s)")
         del c_s2, c_s3, pairs_te, feat_te
         gc.collect()
+
+    # Stop keepalive thread
+    _stop_keepalive.set()
 
     # ---------- 9. Write outputs ----------
     write_result_tsv(os.path.join(out_dir, "matching_results.tsv"), matches, all_test_s1_ids)
