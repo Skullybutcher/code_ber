@@ -417,7 +417,7 @@ def _keepalive(interval: int, stop_event: threading.Event) -> None:
 def run(data_dir: str, out_dir: str, n_splits: int = 5, seed: int = 42,
         sample_s1: int | None = None, max_df: int = 300, prefix_len: int = 4,
         max_pairs_per_prefix_key: int = 200_000, neg_per_pos_cap: int = 15,
-        use_tfidf: bool = False, test_chunk_size: int | None = 100_000,
+        use_tfidf: bool = False, test_chunk_size: int | None = 20_000,
         min_len: int = 4, cache_dir: str | None = None,
         save_model_dir: str | None = None, load_model_dir: str | None = None,
         use_cross_encoder: bool = False, cross_encoder_model: str = "xlm-roberta-base",
@@ -664,7 +664,7 @@ def main():
     ap.add_argument("--max-pairs-per-prefix-key", type=int, default=200_000)
     ap.add_argument("--neg-per-pos-cap", type=int, default=15)
     ap.add_argument("--use-tfidf", action="store_true", help="small-sample TF-IDF blocking only")
-    ap.add_argument("--test-chunk-size", type=int, default=100_000,
+    ap.add_argument("--test-chunk-size", type=int, default=20_000,
                     help="test S1 rows per inference chunk; bounds peak RAM (0 = no chunking)")
     ap.add_argument("--validate", action="store_true",
                     help="also run utils/validate_submission.py if found alongside --data-dir")
