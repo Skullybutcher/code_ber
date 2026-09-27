@@ -42,9 +42,10 @@ except ImportError:
 from io_utils import load_source, load_ground_truth, validate_ground_truth_refs, write_result_tsv
 from normalize import normalize_name, normalize_address
 from blocking import (generate_candidates, generate_candidates_token,
-                      generate_candidates_prefix,
+                      generate_candidates_prefix, generate_candidates_rare,
                       build_prefix_index, query_prefix_index,
                       build_token_index_dict, query_token_index_dict,
+                      cap_candidates_per_s1, counts_to_sets,
                       union_candidates, candidate_recall)
 from features import build_feature_frame_vectorized, FEATURE_NAMES
 from model import train_oof, calibrate_oof, tune_threshold, predict_with_models
@@ -423,7 +424,10 @@ def run(data_dir: str, out_dir: str, n_splits: int = 5, seed: int = 42,
         use_cross_encoder: bool = False, cross_encoder_model: str = "xlm-roberta-base",
         cross_encoder_threshold: float = 0.92, use_faiss: bool = False,
         faiss_top_k: int = 50, faiss_device: str = "cpu",
-        consensus_mode: str = "and") -> None:
+        consensus_mode: str = "and",
+        max_cands_per_entity: int = 300,
+        use_rare: bool = False, rare_min_len: int = 6,
+        rare_max_df: int = 2000) -> None:
     os.makedirs(out_dir, exist_ok=True)
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
@@ -566,12 +570,24 @@ def run(data_dir: str, out_dir: str, n_splits: int = 5, seed: int = 42,
         tok_idx_s3 = build_token_index_dict(s3_te, min_len=min_len, max_df=max_df)
         log(f"  tok_idx_s3 ready: {len(tok_idx_s3):,} tokens ({time.time() - t2:.1f}s)")
         t3 = time.time()
+        # Rare rescue channel: tokens in (max_df, rare_max_df] that main index drops
+        rare_idx_s2 = generate_candidates_rare(
+            s2_te, min_len=rare_min_len, max_df=max_df, max_df_long=rare_max_df
+        ) if use_rare else {}
+        rare_idx_s3 = generate_candidates_rare(
+            s3_te, min_len=rare_min_len, max_df=max_df, max_df_long=rare_max_df
+        ) if use_rare else {}
+        if use_rare:
+            log(f"  rare_idx_s2: {len(rare_idx_s2):,} band tokens  "
+                f"rare_idx_s3: {len(rare_idx_s3):,} band tokens ({time.time() - t3:.1f}s)")
+        t4 = time.time()
         pfx_idx_s2, pfx_cnt_s2 = build_prefix_index(s2_te, prefix_len=prefix_len)
         pfx_idx_s3, pfx_cnt_s3 = build_prefix_index(s3_te, prefix_len=prefix_len)
-        log(f"  prefix indices ready ({time.time() - t3:.1f}s). Total index build: {time.time() - t_idx:.1f}s")
+        log(f"  prefix indices ready ({time.time() - t4:.1f}s). Total index build: {time.time() - t_idx:.1f}s")
     else:
         tok_idx_s2 = tok_idx_s3 = pfx_idx_s2 = pfx_idx_s3 = None
         pfx_cnt_s2 = pfx_cnt_s3 = None
+        rare_idx_s2 = rare_idx_s3 = {}
 
     with open(cand_path, "w", encoding="utf-8") as cand_f:
         cand_f.write("source1_entity_id\tcandidate_entity_ids\n")
@@ -580,18 +596,47 @@ def run(data_dir: str, out_dir: str, n_splits: int = 5, seed: int = 42,
         s1_chunk = s1_te.iloc[ci * chunk:(ci + 1) * chunk]
         t0 = time.time()
         if use_index:
-            # Dict-based query: no merge, no rehash — ~10s per chunk
+            # Query token index -> counts dict {s1_id: {other_id: shared_token_count}}
+            cnt_s2 = query_token_index_dict(s1_chunk, tok_idx_s2, min_len=min_len)
+            cnt_s3 = query_token_index_dict(s1_chunk, tok_idx_s3, min_len=min_len)
+            # Convert counts to sets for union with prefix channel
+            c_s2 = counts_to_sets(cnt_s2)
+            c_s3 = counts_to_sets(cnt_s3)
+            # Add prefix channel
             c_s2 = union_candidates(
-                query_token_index_dict(s1_chunk, tok_idx_s2, min_len=min_len),
+                c_s2,
                 query_prefix_index(s1_chunk, pfx_idx_s2, pfx_cnt_s2, prefix_len=prefix_len,
                                    max_pairs_per_key=max_pairs_per_prefix_key))
             c_s3 = union_candidates(
-                query_token_index_dict(s1_chunk, tok_idx_s3, min_len=min_len),
+                c_s3,
                 query_prefix_index(s1_chunk, pfx_idx_s3, pfx_cnt_s3, prefix_len=prefix_len,
                                    max_pairs_per_key=max_pairs_per_prefix_key))
+            # Add rare rescue channel if enabled
+            if use_rare:
+                rare_q_s2 = query_token_index_dict(s1_chunk, rare_idx_s2, min_len=rare_min_len)
+                rare_q_s3 = query_token_index_dict(s1_chunk, rare_idx_s3, min_len=rare_min_len)
+                c_s2 = union_candidates(c_s2, counts_to_sets(rare_q_s2))
+                c_s3 = union_candidates(c_s3, counts_to_sets(rare_q_s3))
+                # Merge rare counts into main counts for ranking
+                for eid, rc in rare_q_s2.items():
+                    if eid in cnt_s2:
+                        for oid, v in rc.items():
+                            cnt_s2[eid][oid] = cnt_s2[eid].get(oid, 0) + v
+                    else:
+                        cnt_s2[eid] = dict(rc)
+                for eid, rc in rare_q_s3.items():
+                    if eid in cnt_s3:
+                        for oid, v in rc.items():
+                            cnt_s3[eid][oid] = cnt_s3[eid].get(oid, 0) + v
+                    else:
+                        cnt_s3[eid] = dict(rc)
+            # Ranked cap on S2+S3 union — the ONLY safe way to bound pair-frame RAM
+            cap_candidates_per_s1(c_s2, c_s3, cnt_s2, cnt_s3,
+                                  max_cands=max_cands_per_entity)
         else:
             c_s2 = block(s1_chunk, s2_te)
             c_s3 = block(s1_chunk, s3_te)
+            cnt_s2 = cnt_s3 = {}
 
         # FAISS dense retrieval candidates (union with token/prefix)
         if faiss_retriever is not None:
@@ -691,6 +736,15 @@ def main():
                     help="probability threshold for cross-encoder (consensus AND with LightGBM)")
     ap.add_argument("--consensus-mode", type=str, default="and", choices=["and", "or", "weighted"],
                     help="consensus mode for TF-IDF + cross-encoder ensemble")
+    ap.add_argument("--max-cands-per-entity", type=int, default=300,
+                    help="ranked cap on S2+S3 union per S1 entity; 0=no cap. "
+                         "300 => max 300*chunk pairs per chunk, ~3 GB RAM at chunk=20k")
+    ap.add_argument("--use-rare", action="store_true",
+                    help="add rescue channel for tokens in (max-df, rare-max-df]")
+    ap.add_argument("--rare-min-len", type=int, default=6,
+                    help="min token length for rescue channel (default 6)")
+    ap.add_argument("--rare-max-df", type=int, default=2000,
+                    help="upper df bound of rescue band (default 2000)")
     args = ap.parse_args()
 
     run(args.data_dir, args.out_dir, n_splits=args.n_splits, seed=args.seed,
@@ -704,7 +758,10 @@ def main():
         faiss_device=args.faiss_device, use_cross_encoder=args.use_cross_encoder,
         cross_encoder_model=args.cross_encoder_model,
         cross_encoder_threshold=args.cross_encoder_threshold,
-        consensus_mode=args.consensus_mode)
+        consensus_mode=args.consensus_mode,
+        max_cands_per_entity=args.max_cands_per_entity,
+        use_rare=args.use_rare, rare_min_len=args.rare_min_len,
+        rare_max_df=args.rare_max_df)
 
     if args.validate:
         validator = os.path.join(args.data_dir, "utils", "validate_submission.py")

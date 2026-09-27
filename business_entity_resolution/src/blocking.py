@@ -185,12 +185,14 @@ def build_token_index_dict(other_df, min_len: int = 4, max_df: int = 50) -> dict
 
 
 def query_token_index_dict(
-    s1_chunk, token_index: dict, min_len: int = 4
-) -> Dict[str, Set[str]]:
+    s1_chunk, token_index: dict, min_len: int = 4,
+) -> Dict[str, Dict[str, int]]:
     """Query a dict token index for one S1 chunk.
 
-    Returns {s1_entity_id: set(other_entity_ids)}.
-    ~10 s for a 100k-row chunk against a 5M-record index.
+    Returns {s1_entity_id: {other_entity_id: shared_token_count}}.
+    The shared_token_count is the number of distinct capped tokens the pair
+    shares — used by cap_candidates_per_s1() to rank candidates before capping.
+    Returns counts instead of plain sets so the caller can rank and cap smartly.
     """
     if "_norm_name" not in s1_chunk.columns:
         s1_chunk = s1_chunk.copy()
@@ -201,19 +203,103 @@ def query_token_index_dict(
     addrs = s1_chunk["_norm_addr"].fillna("").to_numpy()
     eids = s1_chunk["entity_id"].to_numpy()
 
-    result: Dict[str, Set[str]] = {}
+    result: Dict[str, Dict[str, int]] = {}
     for eid, name, addr in zip(eids, names, addrs):
-        matches: Set[str] = set()
+        counts: Dict[str, int] = {}
         seen: Set[str] = set()
         for tok in (name + " " + addr).split():
             if len(tok) >= min_len and tok not in seen:
                 seen.add(tok)
                 ids = token_index.get(tok)
                 if ids is not None:
-                    matches.update(ids.tolist())
-        if matches:
-            result[eid] = matches
+                    for oid in ids:
+                        counts[oid] = counts.get(oid, 0) + 1
+        if counts:
+            result[eid] = counts
     return result
+
+
+def cap_candidates_per_s1(
+    cand_s2: Dict[str, Set[str]], cand_s3: Dict[str, Set[str]],
+    counts_s2: Dict[str, Dict[str, int]], counts_s3: Dict[str, Dict[str, int]],
+    max_cands: int,
+) -> None:
+    """Rank and cap the S2+S3 candidate union per S1 entity IN PLACE.
+
+    Ranking key per candidate: (-shared_tokens, other_id).
+    Candidates sharing more tokens with the S1 entity are ranked first.
+    Prefix-exclusive candidates (not in token counts) are ranked as score=1,
+    behind multi-token matches but ahead of nothing.
+
+    This is the only correct way to cap: a hard per-token break (previous
+    approach) cuts off tokens mid-iteration, missing candidates that share
+    a later token but not earlier ones.  Ranked capping guarantees the top
+    max_cands most-similar candidates survive.
+
+    max_cands=0 means no cap (training blocking where RAM is less critical).
+    """
+    if max_cands <= 0:
+        return
+    for eid in list(cand_s2.keys()) | list(cand_s3.keys()):
+        s2 = cand_s2.get(eid, set())
+        s3 = cand_s3.get(eid, set())
+        union = s2 | s3
+        if len(union) <= max_cands:
+            continue
+        c2 = counts_s2.get(eid, {})
+        c3 = counts_s3.get(eid, {})
+
+        def _score(oid: str) -> int:
+            return max(c2.get(oid, 0), c3.get(oid, 0))
+
+        keep = set(sorted(union, key=lambda o: (-_score(o), o))[:max_cands])
+        if eid in cand_s2:
+            cand_s2[eid] = cand_s2[eid] & keep
+        if eid in cand_s3:
+            cand_s3[eid] = cand_s3[eid] & keep
+
+
+def counts_to_sets(counts_dict: Dict[str, Dict[str, int]]) -> Dict[str, Set[str]]:
+    """Convert {s1_id: {other_id: count}} -> {s1_id: set(other_ids)}."""
+    return {eid: set(counts.keys()) for eid, counts in counts_dict.items()}
+
+
+def generate_candidates_rare(
+    other_df, min_len: int = 6, max_df: int = 50, max_df_long: int = 2000,
+) -> dict:
+    """Build a 'rescue' index for tokens between max_df and max_df_long.
+
+    The main index (max_df=50) drops tokens appearing in >50 records to avoid
+    candidate explosion.  But legitimate shared tokens like 'general', 'motors',
+    'group' appear in 51–2000 records and are dropped, causing missed pairs.
+    This index catches tokens in the band (max_df, max_df_long].
+
+    Returns dict[token -> np.array(entity_ids)] for the band tokens only.
+    RAM: small (~100–300 MB) because band tokens are much fewer than total tokens.
+    Build time: ~20–40 s for 5M records.
+    """
+    if "_norm_name" not in other_df.columns:
+        other_df = other_df.copy()
+        other_df["_norm_name"] = other_df["business_name"].map(normalize_name)
+        other_df["_norm_addr"] = other_df["business_address"].map(normalize_address)
+
+    inv: Dict[str, List[str]] = defaultdict(list)
+    names = other_df["_norm_name"].fillna("").to_numpy()
+    addrs = other_df["_norm_addr"].fillna("").to_numpy()
+    eids = other_df["entity_id"].to_numpy()
+
+    for eid, name, addr in zip(eids, names, addrs):
+        seen: Set[str] = set()
+        for tok in (name + " " + addr).split():
+            if len(tok) >= min_len and tok not in seen:
+                inv[tok].append(eid)
+                seen.add(tok)
+
+    return {
+        tok: np.array(ids)
+        for tok, ids in inv.items()
+        if max_df < len(ids) <= max_df_long
+    }
 
 
 def build_prefix_index(other_df, prefix_len: int = 4):
