@@ -212,7 +212,9 @@ def query_token_index_dict(
                 seen.add(tok)
                 ids = token_index.get(tok)
                 if ids is not None:
-                    for oid in ids:
+                    # ids is np.ndarray — convert to str to avoid numpy.str_
+                    # keys mixing with plain str keys from prefix channel
+                    for oid in ids.tolist():
                         counts[oid] = counts.get(oid, 0) + 1
         if counts:
             result[eid] = counts
@@ -240,7 +242,7 @@ def cap_candidates_per_s1(
     """
     if max_cands <= 0:
         return
-    for eid in list(cand_s2.keys()) | list(cand_s3.keys()):
+    for eid in set(cand_s2.keys()) | set(cand_s3.keys()):
         s2 = cand_s2.get(eid, set())
         s3 = cand_s3.get(eid, set())
         union = s2 | s3
@@ -248,11 +250,12 @@ def cap_candidates_per_s1(
             continue
         c2 = counts_s2.get(eid, {})
         c3 = counts_s3.get(eid, {})
-
-        def _score(oid: str) -> int:
-            return max(c2.get(oid, 0), c3.get(oid, 0))
-
-        keep = set(sorted(union, key=lambda o: (-_score(o), o))[:max_cands])
+        # Use default-arg capture to avoid late-binding closure bug
+        keep = set(
+            sorted(union,
+                   key=lambda o, _c2=c2, _c3=c3: (-(max(_c2.get(o, 0), _c3.get(o, 0))), o)
+                   )[:max_cands]
+        )
         if eid in cand_s2:
             cand_s2[eid] = cand_s2[eid] & keep
         if eid in cand_s3:
